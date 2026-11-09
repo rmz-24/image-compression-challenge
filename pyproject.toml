@@ -1,0 +1,20 @@
+[project]
+name = "imgcomp"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "constriction>=0.5.0",
+    "numpy>=2.5.4",
+    "pillow>=13.0.0",
+    "scipy>=1.18.1",
+    "torch==2.8.0",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
