@@ -16,7 +16,10 @@ from imgcomp.runtime import FINE_LEVELS, Runtime, pack, pad_image
 
 WEIGHTS = Path(__file__).resolve().parent / "weights" / "codec.pt"
 TARGET = 0.95
-MARGIN = 0.0005  # headroom for float differences between machines in the synthesis transform
+REFINE_LAMBDA = 100.0   # weight of the quality-shortfall term during latent refinement
+REFINE_SLACK = 0.0002   # refinement aims slightly above the gate (its rate/quality model is approximate)
+REFINE_WINDOW = 48      # refined search covers levels [l0 - window, l0]
+MARGIN = 0.00005  # headroom for float differences between machines in the synthesis transform (measured ~1e-7)
 
 
 def score(rt, ref, out):
@@ -51,7 +54,8 @@ def compress_image(rt, img, refine_iters=0):
 
         def trial(level):
             if level not in cache:
-                yl = rt.refine(x, y, level, level_lambda(level), refine_iters) if refine else y
+                yl = rt.refine(x, y, level, REFINE_LAMBDA, refine_iters,
+                               target=TARGET + MARGIN + REFINE_SLACK) if refine else y
                 words, yq = rt.encode_latent(yl, level)
                 q = score(rt, img, rt.synthesize(yq, level, h, w))
                 cache[level] = (words, q)
@@ -64,7 +68,7 @@ def compress_image(rt, img, refine_iters=0):
     l0 = smallest_passing(plain, 0, FINE_LEVELS - 1)
     plain(l0)
     if refine_iters:
-        smallest_passing(make_trial(True), max(0, l0 - 64), l0)
+        smallest_passing(make_trial(True), max(0, l0 - REFINE_WINDOW), l0)
     if not passing:  # nothing reaches the target: keep the best quality available
         words, q = plain(FINE_LEVELS - 1)
         return pack(FINE_LEVELS - 1, h, w, words), FINE_LEVELS - 1, q

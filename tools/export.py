@@ -10,7 +10,7 @@ from imgcomp.runtime import export
 
 ck = torch.load(sys.argv[1], map_location="cpu")
 m = Codec()
-m.load_state_dict(ck["model"])
+m.load_state_dict(ck["model"], strict=False)
 Path(sys.argv[2]).parent.mkdir(parents=True, exist_ok=True)
 export(m, sys.argv[2])
 print("exported step", ck["step"], "->", sys.argv[2], f"{Path(sys.argv[2]).stat().st_size / 1e6:.1f} MB")

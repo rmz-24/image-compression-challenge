@@ -1,0 +1,7 @@
+# Python 3.12. On Linux, PyPI's torch 2.8.0 runs on CPU and CUDA GPUs; a GPU is optional
+# (compress/decompress fall back to CPU automatically).
+torch==2.8.0
+numpy==2.5.4
+pillow==13.0.0
+scipy==1.18.1
+constriction==0.5.0

@@ -15,7 +15,7 @@ M = 320          # latent channels
 NZ = 192         # hyper-latent channels
 SLICES = [16, 16, 32, 64, 192]
 LEVELS = 8
-LAMBDAS = [1.5 * (64 / 1.5) ** (i / (LEVELS - 1)) for i in range(LEVELS)]
+LAMBDAS = [0.25 * (24 / 0.25) ** (i / (LEVELS - 1)) for i in range(LEVELS)]
 
 # fixed-point format of the integer entropy-parameter path
 FA = 8           # fractional bits of activations
@@ -181,6 +181,26 @@ class SliceParams(nn.Module):
         return self.net(x)
 
 
+class SpatialCtx(nn.Module):
+    """Checkerboard context: refines non-anchor params from the decoded anchors of the same slice."""
+
+    def __init__(self, c):
+        super().__init__()
+        self.ctx = nn.Sequential(QConv(c, 2 * c, 5, 1, 2))
+        self.agg = nn.Sequential(qconv(4 * c, 256, 1), QAct(), qconv(256, 2 * c, 1))
+        nn.init.zeros_(self.agg[-1].weight)
+        nn.init.zeros_(self.agg[-1].bias)
+
+    def forward(self, y_anchor, out):
+        return self.agg(torch.cat([out, self.ctx(y_anchor)], dim=1))
+
+
+def anchor_mask(h, w, device):
+    r = torch.arange(h, device=device)[:, None]
+    c = torch.arange(w, device=device)[None, :]
+    return ((r + c) % 2 == 0).float()[None, None]
+
+
 # ------------------------------------------------------------ entropy models ----
 
 class EntropyBottleneck(nn.Module):
@@ -244,6 +264,7 @@ class Codec(nn.Module):
         self.eb = EntropyBottleneck(NZ)
         cp = [sum(SLICES[:i]) for i in range(len(SLICES))]
         self.params = nn.ModuleList(SliceParams(cp[i], SLICES[i]) for i in range(len(SLICES)))
+        self.spatial = nn.ModuleList(SpatialCtx(c) for c in SLICES)
         lam = torch.tensor(LAMBDAS)
         init = 0.3 * torch.log(lam / lam[LEVELS // 2])
         self.log_gain = nn.Parameter(init[:, None].repeat(1, M))
@@ -262,31 +283,35 @@ class Codec(nn.Module):
         gi = (1 - t) * self.log_igain[lo] + t * self.log_igain[lo + 1]
         return torch.exp(g)[:, :, None, None], torch.exp(gi)[:, :, None, None]
 
-    def entropy_params(self, hf, prev, i):
-        out = self.params[i](torch.cat([hf] + prev, dim=1))
-        mu, ls = out.chunk(2, dim=1)
-        return mu, ls
-
     def forward(self, x, level, noise=True):
         g, gi = self.gains(level)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and x.is_cuda):
             ys = self.g_a(x).float() * g
+        return self.from_latent(ys, gi, noise)
+
+    def from_latent(self, ys, gi, noise=True):
+        """ys: gain-scaled latent. Returns (x_hat, bits per image)."""
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and ys.is_cuda):
             z = self.h_a(ys).float()
-        zn = z + torch.empty_like(z).uniform_(-0.5, 0.5) if noise else torch.round(z)
+        zn = z + torch.empty_like(z).uniform_(-0.5, 0.5) if noise else ste_round(z)
         lik_z = self.eb.likelihood(zn)
         hf = self.h_s(ste_round(z))
         prev, liks = [], []
+        mask = anchor_mask(ys.shape[2], ys.shape[3], ys.device)
         for i, ysl in enumerate(ys.split(SLICES, dim=1)):
-            mu, ls = self.entropy_params(hf, prev, i)
+            out = self.params[i](torch.cat([hf] + prev, dim=1))
+            mu, _ = out.chunk(2, dim=1)
+            ya = (ste_round(ysl - mu) + mu) * mask
+            out = torch.where(mask.bool(), out, out + self.spatial[i](ya, out))
+            mu, ls = out.chunk(2, dim=1)
             ls = bound_log_sig(ls)
             yq = ste_round(ysl - mu) + mu
             noisy = ysl + torch.empty_like(ysl).uniform_(-0.5, 0.5) if noise else yq
             liks.append(gaussian_likelihood(noisy, mu, ls))
             prev.append(yq)
         y_hat = torch.cat(prev, dim=1)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and x.is_cuda):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and ys.is_cuda):
             x_hat = self.g_s(y_hat * gi).float()
         lik_y = torch.cat(liks, dim=1)
-        bits = (-torch.log2(lik_y.clamp_min(1e-9))).sum(dim=(1, 2, 3)) + \
-               (-torch.log2(lik_z.clamp_min(1e-9))).sum(dim=(1, 2, 3))
+        bits = (-torch.log2(lik_y.clamp_min(1e-9))).sum(dim=(1, 2, 3)) +                (-torch.log2(lik_z.clamp_min(1e-9))).sum(dim=(1, 2, 3))
         return x_hat, bits

@@ -99,6 +99,7 @@ def export(model: Codec, path):
         "g_a": half(model.g_a), "h_a": half(model.h_a), "g_s": half(model.g_s),
         "h_s": _export_intnet(model.h_s.net),
         "params": [_export_intnet(p.net) for p in model.params],
+        "spatial": [{"ctx": _export_intnet(sp.ctx), "agg": _export_intnet(sp.agg)} for sp in model.spatial],
         "gain": g.view(FINE_LEVELS, M).cpu(), "igain": gi.view(FINE_LEVELS, M).cpu(),
         "ztab": _z_tables(model.eb),
         "eb": {k: v.cpu() for k, v in model.eb.state_dict().items()},
@@ -151,39 +152,37 @@ class Runtime:
         self.gain, self.igain = blob["gain"], blob["igain"]
         self.zmodels = [(off, _CM.Categorical(p, perfect=False), len(p) - 1) for off, p in blob["ztab"]]
         self.ymodels = [(_CM.Categorical(p, perfect=False), (len(p) - 2) // 2) for p in blob["ytab"]]
+        self.spatial = [{k: _prep_intnet(v) for k, v in sp.items()} for sp in blob["spatial"]]
         self.blob = blob
-        self._diff = None
+        self._twin = None
 
-    # ---- float twin of the entropy model, for encoder-side latent refinement ----
-    def _build_diff(self):
-        def load(seq, layers):
+    # ---- float twin of the deployed model, for encoder-side latent refinement ----
+    def _build_twin(self):
+        twin = Codec()
+        twin.h_a.load_state_dict(self.h_a.state_dict())
+        twin.g_s.load_state_dict(self.g_s.state_dict())
+        twin.eb.load_state_dict(self.blob["eb"])
+        nets = [(twin.h_s.net, self.blob["h_s"])]
+        for i in range(len(SLICES)):
+            nets.append((twin.params[i].net, self.blob["params"][i]))
+            nets.append((twin.spatial[i].ctx, self.blob["spatial"][i]["ctx"]))
+            nets.append((twin.spatial[i].agg, self.blob["spatial"][i]["agg"]))
+        for seq, layers in nets:
             convs = [m for m in seq if isinstance(m, QConv)]
-            for m, L in zip(convs, [L for L in layers if "w" in L]):
+            for m, L in zip(convs, [L for L in layers if "w" in L], strict=True):
                 s = 2.0 ** L["fw"].float()
                 m.weight.data = L["w"].float() / s.view(-1, 1, 1, 1)
                 m.bias.data = (L["b"].double() / (s.double() * 2 ** FA)).float()
-        h_s = HyperSynthesis()
-        load(h_s.net, self.blob["h_s"])
-        params = torch.nn.ModuleList()
-        cp = [sum(SLICES[:i]) for i in range(len(SLICES))]
-        for i, layers in enumerate(self.blob["params"]):
-            p = SliceParams(cp[i], SLICES[i])
-            load(p.net, layers)
-            params.append(p)
-        eb = EntropyBottleneck(NZ)
-        eb.load_state_dict(self.blob["eb"])
-        self._diff = torch.nn.ModuleDict({"h_s": h_s, "params": params, "eb": eb}).to(self.dev).eval()
-        for p in self._diff.parameters():
+        twin.to(self.dev).eval()
+        for p in twin.parameters():
             p.requires_grad_(False)
-        for mod in (self.h_a, self.g_s):
-            for p in mod.parameters():
-                p.requires_grad_(False)
+        self._twin = twin
 
-    def refine(self, x, y0, level, lam, iters=150, lr=0.02):
-        """Gradient-descend the latent y on bits/px + lam * (1 - MS-SSIM) at a fixed level."""
-        if self._diff is None:
-            self._build_diff()
-        d = self._diff
+    def refine(self, x, y0, level, lam, iters=60, lr=0.002, target=None):
+        """Gradient-descend the latent y at a fixed level on bits/px + lam * distortion term.
+        target=None: distortion = 1 - MS-SSIM; else relu(target - MS-SSIM)."""
+        if self._twin is None:
+            self._build_twin()
         x = x.to(self.dev)
         h, w = x.shape[2:]
         g = self.gain[level].to(self.dev).view(1, -1, 1, 1)
@@ -192,20 +191,10 @@ class Runtime:
         opt = torch.optim.Adam([y], lr=lr)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
         for _ in range(iters):
-            ys = y * g
-            zq = ste_round(self.h_a(ys))
-            bits = -torch.log2(d["eb"].likelihood(zq).clamp_min(1e-9)).sum()
-            hf = d["h_s"](zq)
-            prev = []
-            for i, ysl in enumerate(ys.split(SLICES, dim=1)):
-                out = d["params"][i](torch.cat([hf] + prev, dim=1))
-                mu, ls = out.chunk(2, dim=1)
-                yq = ste_round(ysl - mu) + mu
-                lik = gaussian_likelihood(yq, mu, bound_log_sig(ls))
-                bits = bits - torch.log2(lik.clamp_min(1e-9)).sum()
-                prev.append(yq)
-            x_hat = self.g_s(torch.cat(prev, dim=1) * gi).clamp(0, 1)
-            loss = bits / (h * w) + lam * (1 - ms_ssim(x, x_hat)[0])
+            x_hat, bits = self._twin.from_latent(y * g, gi, noise=False)
+            ms = ms_ssim(x, x_hat.clamp(0, 1))[0]
+            dist = 1 - ms if target is None else torch.relu(target - ms)
+            loss = bits[0] / (h * w) + lam * dist
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -213,12 +202,30 @@ class Runtime:
         return y.detach()
 
     # ---- shared entropy-parameter pass (identical on both sides) ----
-    def _slice_params(self, hf, prev, i):
-        out = run_intnet(self.params[i], torch.cat([hf] + prev, dim=1))
-        c = SLICES[i]
+    @staticmethod
+    def _split(out, c):
         mu, t = out[:, :c], out[:, c:]
         idx = torch.div(t.long() - SCALE_T0 + SCALE_D // 2, SCALE_D, rounding_mode="floor")
         return mu, idx.clamp(0, SCALE_K - 1)
+
+    def _slices(self, hf, step):
+        """Entropy-parameter pass shared by encoder and decoder. For each slice, anchors (checkerboard)
+        are coded first, then non-anchors with params refined from the decoded anchors.
+        step(i, mu, idx, sel) codes the positions sel (bool HxW) and returns symbols (tensor like mu)."""
+        h, w = hf.shape[2:]
+        sel = ((np.arange(h)[:, None] + np.arange(w)[None, :]) % 2 == 0)
+        m = torch.from_numpy(sel).double()[None, None]
+        prev = []
+        for i, c in enumerate(SLICES):
+            out = run_intnet(self.params[i], torch.cat([hf] + prev, dim=1))
+            mu, idx = self._split(out, c)
+            ya = (mu + step(i, mu, idx, sel) * 2 ** FA) * m
+            sp = self.spatial[i]
+            out = out + run_intnet(sp["agg"], torch.cat([out, run_intnet(sp["ctx"], ya)], dim=1))
+            mu2, idx2 = self._split(out, c)
+            yn = mu2 + step(i, mu2, idx2, ~sel) * 2 ** FA
+            prev.append(torch.where(m.bool(), ya, yn))
+        return torch.cat(prev, dim=1)
 
     # ---- symbol coding helpers ----
     @staticmethod
@@ -292,27 +299,26 @@ class Runtime:
 
     @torch.no_grad()
     def encode_latent(self, y, level):
-        """Quantize + entropy-code y at fine level. Returns (payload bytes, y_hat for synthesis)."""
+        """Quantize + entropy-code y at fine level. Returns (range-coder words, y_hat fixed point)."""
         ys = y * self.gain[level].to(y.device).view(1, -1, 1, 1)
         z = self.h_a(ys)
         zq = torch.round(z).double().cpu()
         hf = run_intnet(self.h_s, zq * 2 ** FA)
         ys = ys.double().cpu()
+        bounds = np.cumsum([0] + SLICES)
         enc = _Q.RangeEncoder()
         self._enc_z(enc, zq[0].long().numpy())
-        prev, c0 = [], 0
-        for i, c in enumerate(SLICES):
-            mu, idx = self._slice_params(hf, prev, i)
-            sym = torch.round(ys[:, c0:c0 + c] - mu / 2 ** FA)
-            self._code_slice(enc, sym[0].long().numpy(), idx[0].numpy())
-            prev.append(mu + sym * 2 ** FA)
-            c0 += c
-        return enc.get_compressed(), torch.cat(prev, dim=1)
 
-    def _code_slice(self, enc, sym, idx):
-        for k in np.unique(idx):
-            model, r = self.ymodels[k]
-            self._enc_group(enc, sym[idx == k], model, r)
+        def step(i, mu, idx, sel):
+            sym = torch.round(ys[:, bounds[i]:bounds[i + 1]] - mu / 2 ** FA)
+            sv, iv = sym[0].long().numpy()[:, sel], idx[0].numpy()[:, sel]
+            for k in np.unique(iv):
+                model, r = self.ymodels[k]
+                self._enc_group(enc, sv[iv == k], model, r)
+            return sym
+
+        y_hat = self._slices(hf, step)
+        return enc.get_compressed(), y_hat
 
     @torch.no_grad()
     def synthesize(self, yq, level, h, w):
@@ -327,17 +333,19 @@ class Runtime:
         dec = _Q.RangeDecoder(words)
         zq = torch.from_numpy(self._dec_z(dec, hy // 4, wy // 4)).double()[None]
         hf = run_intnet(self.h_s, zq * 2 ** FA)
-        prev = []
-        for i, c in enumerate(SLICES):
-            mu, idx = self._slice_params(hf, prev, i)
-            idx_np = idx[0].numpy()
-            sym = np.zeros(idx_np.shape, dtype=np.int64)
-            for k in np.unique(idx_np):
+
+        def step(i, mu, idx, sel):
+            iv = idx[0].numpy()[:, sel]
+            sv = np.zeros(iv.shape, dtype=np.int64)
+            for k in np.unique(iv):
                 model, r = self.ymodels[k]
-                sel = idx_np == k
-                sym[sel] = self._dec_group(dec, int(sel.sum()), model, r)
-            prev.append(mu + torch.from_numpy(sym).double()[None] * 2 ** FA)
-        return torch.cat(prev, dim=1)
+                g = iv == k
+                sv[g] = self._dec_group(dec, int(g.sum()), model, r)
+            sym = np.zeros(idx.shape[1:], dtype=np.int64)
+            sym[:, sel] = sv
+            return torch.from_numpy(sym).double()[None]
+
+        return self._slices(hf, step)
 
 
 # ------------------------------------------------------------- bitstream ----

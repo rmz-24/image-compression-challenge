@@ -114,7 +114,8 @@ def main():
     step = 0
     if args.resume:
         ck = torch.load(args.resume, map_location=dev)
-        model.load_state_dict(ck["model"])
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        print("missing keys:", len(missing), "unexpected:", unexpected)
         if not args.reset_opt and "opt" in ck:
             opt.load_state_dict(ck["opt"])
         step = ck["step"]
