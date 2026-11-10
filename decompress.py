@@ -10,7 +10,8 @@ WEIGHTS = Path(__file__).resolve().parent / "weights" / "codec.pt"
 
 
 def main():
-    src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+    # strip quotes left by shlex.quote when a command line goes through cmd.exe on Windows
+    src, dst = (Path(a.strip("'\"")) for a in sys.argv[1:3])
     dst.mkdir(parents=True, exist_ok=True)
     rt = Runtime(WEIGHTS)
     for p in sorted(src.glob("*.bin")):

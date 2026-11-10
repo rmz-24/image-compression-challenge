@@ -78,7 +78,8 @@ def compress_image(rt, img, refine_iters=0):
 
 
 def main():
-    src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+    # strip quotes left by shlex.quote when a command line goes through cmd.exe on Windows
+    src, dst = (Path(a.strip("'\"")) for a in sys.argv[1:3])
     dst.mkdir(parents=True, exist_ok=True)
     refine_iters = int(sys.argv[3]) if len(sys.argv) > 3 else 0
     rt = Runtime(WEIGHTS)
