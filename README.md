@@ -23,6 +23,11 @@ also works on CPU only, and the bitstreams decode identically on any machine (se
 | DIV2K valid, 10 unseen 2K images | 0.092 | 0.9501 | passed |
 | JPEG, per-image best quality (Kodak, reference) | 0.481 | ≥ 0.95 | passed |
 
+![Original vs this codec vs JPEG at the same size vs JPEG passing 0.95](docs/comparison.png)
+
+Kodak 23, 13 and 1. Yellow box = zoomed crop below. Regenerate with
+`python tools/make_figure.py data/kodak <compressed_dir> <reconstructed_dir> docs/comparison.png kodim23:490,60 kodim13:300,150 kodim01:350,250`.
+
 ## Method
 
 - **Transform**: ELIC-style analysis and synthesis networks, with strided 5×5 convolutions and
