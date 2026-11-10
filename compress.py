@@ -66,7 +66,8 @@ def compress_image(rt, img, refine_iters=0):
 
     plain = make_trial(False)
     l0 = smallest_passing(plain, 0, FINE_LEVELS - 1)
-    plain(l0)
+    for lv in range(max(0, l0 - 6), l0 + 1):  # quality is only roughly monotonic in level
+        plain(lv)
     if refine_iters:
         smallest_passing(make_trial(True), max(0, l0 - REFINE_WINDOW), l0)
     if not passing:  # nothing reaches the target: keep the best quality available
